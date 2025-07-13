@@ -8,11 +8,13 @@ import datetime
 import struct
 import shutil
 import glob
+import time
 from pathlib import Path
 
 # Constantes
 LOVEBOX_MAGIC = b'LOVEBOXv1'
 QEMU_CMD = "qemu-system-x86_64"
+CHUNK_SIZE = 16 * 1024 * 1024  # 16MB por chunk (óptimo para balance velocidad/memoria)
 
 def create_vm(name, storage, params):
     """Crea una nueva máquina virtual LoveBox"""
@@ -48,7 +50,7 @@ def create_vm(name, storage, params):
     print(f"  Parámetros QEMU: {params}")
 
 def pack_box():
-    """Empaqueta el directorio actual en formato .box"""
+    """Empaqueta el directorio actual en formato .box (usando chunks)"""
     cwd = os.path.basename(os.getcwd())
     output_file = cwd + ".box"
 
@@ -56,164 +58,210 @@ def pack_box():
         print("Error: No se detectó una estructura LoveBox válida")
         return
 
-    with open(output_file, 'wb') as f:
-        f.write(LOVEBOX_MAGIC)
+    print(f"\nEmpaquetando '{cwd}' (procesando en chunks de {CHUNK_SIZE/1024/1024}MB)...")
 
-        for file_path in glob.glob('**', recursive=True):
-            if os.path.isdir(file_path):
-                continue
+    try:
+        with open(output_file, 'wb') as f_out:
+            f_out.write(LOVEBOX_MAGIC)
 
-            with open(file_path, 'rb') as content_file:
-                content = content_file.read()
+            for file_path in glob.glob('**', recursive=True):
+                if os.path.isdir(file_path) or "LoveBox" in file_path:
+                    continue
 
-            relative_path = Path(file_path).as_posix().encode('utf-8')
-            f.write(struct.pack('I', len(relative_path)))
-            f.write(relative_path)
-            f.write(struct.pack('Q', len(content)))
-            f.write(content)
+                file_size = os.path.getsize(file_path)
+                relative_path = Path(file_path).as_posix().encode('utf-8')
+                
+                # Escribir metadatos
+                f_out.write(struct.pack('I', len(relative_path)))
+                f_out.write(relative_path)
+                f_out.write(struct.pack('Q', file_size))
 
-    print(f"\nLoveBox empaquetada en '{output_file}'!")
-    print("  Puedes ejecutarla con: lovebox run " + output_file)
+                # Copiar contenido por chunks
+                with open(file_path, 'rb') as f_in:
+                    while True:
+                        chunk = f_in.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        print(f"  Procesando: {file_path} - {f_in.tell()/1024/1024:.1f}MB", end='\r')
+
+        print(f"\n✅ LoveBox empaquetada en '{output_file}'!")
+        print("  Puedes ejecutarla con: lovebox run " + output_file)
+
+    except Exception as e:
+        print(f"\n❌ Error durante empaquetado: {str(e)}")
+        if os.path.exists(output_file):
+            os.remove(output_file)
 
 def unpack_box(box_file):
-    """Desempaqueta un archivo .box"""
+    """Desempaqueta un archivo .box (usando chunks)"""
     if not box_file.endswith('.box'):
         print("Error: El archivo debe tener extensión .box")
         return
 
     dir_name = os.path.basename(box_file)[:-4]
+    if os.path.exists(dir_name):
+        print(f"Error: La carpeta '{dir_name}' ya existe")
+        return
+
+    print(f"\nDesempaquetando '{box_file}'...")
     os.makedirs(dir_name, exist_ok=True)
 
-    with open(box_file, 'rb') as f:
-        magic = f.read(len(LOVEBOX_MAGIC))
-        if magic != LOVEBOX_MAGIC:
-            print("Error: Formato de archivo inválido")
-            return
+    try:
+        with open(box_file, 'rb') as f:
+            magic = f.read(len(LOVEBOX_MAGIC))
+            if magic != LOVEBOX_MAGIC:
+                print("Error: Formato de archivo inválido")
+                return
 
-        while True:
-            len_path_data = f.read(4)
-            if not len_path_data:
-                break
+            while True:
+                len_path_data = f.read(4)
+                if not len_path_data:
+                    break
 
-            len_path = struct.unpack('I', len_path_data)[0]
-            path = f.read(len_path).decode('utf-8')
-            content_size = struct.unpack('Q', f.read(8))[0]
-            content = f.read(content_size)
+                len_path = struct.unpack('I', len_path_data)[0]
+                path = f.read(len_path).decode('utf-8')
+                content_size = struct.unpack('Q', f.read(8))[0]
+                full_path = os.path.join(dir_name, path)
 
-            full_path = os.path.join(dir_name, path)
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-            with open(full_path, 'wb') as out_file:
-                out_file.write(content)
+                # Escribir por chunks
+                with open(full_path, 'wb') as out_file:
+                    remaining = content_size
+                    while remaining > 0:
+                        chunk_size = min(CHUNK_SIZE, remaining)
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        remaining -= len(chunk)
+                        print(f"  Extrayendo: {path} - {(content_size-remaining)/1024/1024:.1f}MB", end='\r')
 
-    print(f"\nLoveBox desempaquetada en '{dir_name}/'")
-    print("  Puedes modificar los archivos y luego empaquetar con: lovebox pack")
+        print(f"\n✅ LoveBox desempaquetada en '{dir_name}/'")
+        print("  Puedes modificar los archivos y luego empaquetar con: lovebox pack")
+
+    except Exception as e:
+        print(f"\n❌ Error durante desempaquetado: {str(e)}")
+        if os.path.exists(dir_name):
+            shutil.rmtree(dir_name)
 
 def run_box(box_file):
-    """Ejecuta una LoveBox desde un archivo .box (con manejo correcto de rutas)"""
+    """Ejecuta una LoveBox desde un archivo .box"""
     if not os.path.exists(box_file):
         print(f"Error: Archivo '{box_file}' no encontrado")
         return
 
     original_dir = os.getcwd()
+    temp_dir = tempfile.mkdtemp()
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            os.chdir(tmpdir)
+        print(f"\nPreparando LoveBox desde: {box_file}")
+        os.chdir(temp_dir)
 
-            # Desempaquetar
-            with open(box_file, 'rb') as f:
-                magic = f.read(len(LOVEBOX_MAGIC))
-                if magic != LOVEBOX_MAGIC:
-                    print("Error: Formato de archivo inválido")
-                    return
-
-                while True:
-                    len_path_data = f.read(4)
-                    if not len_path_data:
-                        break
-
-                    len_path = struct.unpack('I', len_path_data)[0]
-                    path = f.read(len_path).decode('utf-8')
-                    content_size = struct.unpack('Q', f.read(8))[0]
-                    content = f.read(content_size)
-
-                    full_path = os.path.join(tmpdir, path)
-                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-
-                    with open(full_path, 'wb') as out_file:
-                        out_file.write(content)
-
-            # Leer configuración
-            config_path = os.path.join(tmpdir, "settings.json")
-            if not os.path.exists(config_path):
-                print("Error: Configuración no encontrada")
+        # Desempaquetar
+        with open(box_file, 'rb') as f:
+            magic = f.read(len(LOVEBOX_MAGIC))
+            if magic != LOVEBOX_MAGIC:
+                print("Error: Formato de archivo inválido")
                 return
 
-            with open(config_path) as f:
-                config = json.load(f)
+            while True:
+                len_path_data = f.read(4)
+                if not len_path_data:
+                    break
 
-            # Construir comando QEMU con rutas absolutas
-            disk_path = os.path.join(tmpdir, "disk", "disk.qcow2")
-            if not os.path.exists(disk_path):
-                print("Error: Disco virtual no encontrado")
-                return
+                len_path = struct.unpack('I', len_path_data)[0]
+                path = f.read(len_path).decode('utf-8')
+                content_size = struct.unpack('Q', f.read(8))[0]
+                full_path = os.path.join(temp_dir, path)
 
-            qemu_cmd = [
-                QEMU_CMD,
-                "-drive", f"file={disk_path},format=qcow2",
-                "-name", config["name"]
-            ]
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-            # Convertir rutas relativas a absolutas para ISOs
-            if config["qemu_params"]:
-                params = config["qemu_params"].split()
-                i = 0
-                while i < len(params):
-                    if params[i] in ["-cdrom", "-drive", "-kernel"] and i+1 < len(params):
-                        if not os.path.isabs(params[i+1]):
-                            params[i+1] = os.path.join(tmpdir, params[i+1])
-                    i += 1
-                qemu_cmd.extend(params)
+                # Escribir por chunks
+                with open(full_path, 'wb') as out_file:
+                    remaining = content_size
+                    while remaining > 0:
+                        chunk_size = min(CHUNK_SIZE, remaining)
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        remaining -= len(chunk)
 
-            print("\nIniciando LoveBox...")
-            print(f"  Máquina: {config['name']}")
-            print(f"  Comando: {' '.join(qemu_cmd)}\n")
+        # Leer configuración
+        config_path = os.path.join(temp_dir, "settings.json")
+        if not os.path.exists(config_path):
+            print("Error: Configuración no encontrada")
+            return
 
-            try:
-                subprocess.run(qemu_cmd, check=True)
-            except subprocess.CalledProcessError:
-                print("\nQEMU terminó con errores")
-            except KeyboardInterrupt:
-                print("\nEjecución interrumpida")
+        with open(config_path) as f:
+            config = json.load(f)
 
-            # Re-empaquetar
-            print("\nGuardando estado de la LoveBox...")
-            os.chdir(original_dir)
-            temp_box = box_file + ".tmp"
+        # Construir comando QEMU
+        disk_path = os.path.join(temp_dir, "disk", "disk.qcow2")
+        if not os.path.exists(disk_path):
+            print("Error: Disco virtual no encontrado")
+            return
 
-            with open(temp_box, 'wb') as f:
-                f.write(LOVEBOX_MAGIC)
+        qemu_cmd = [QEMU_CMD, "-drive", f"file={disk_path},format=qcow2", "-name", config["name"]]
 
-                for root, _, files in os.walk(tmpdir):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        rel_path = os.path.relpath(file_path, tmpdir)
+        # Convertir rutas relativas a absolutas para parámetros
+        if config["qemu_params"]:
+            params = config["qemu_params"].split()
+            i = 0
+            while i < len(params):
+                if params[i] in ["-cdrom", "-drive", "-kernel"] and i+1 < len(params):
+                    if not os.path.isabs(params[i+1]):
+                        params[i+1] = os.path.join(temp_dir, params[i+1])
+                i += 1
+            qemu_cmd.extend(params)
 
-                        with open(file_path, 'rb') as content_file:
-                            content = content_file.read()
+        print("\nIniciando LoveBox...")
+        print(f"  Máquina: {config['name']}")
+        print(f"  Comando: {' '.join(qemu_cmd)}\n")
 
-                        encoded_path = rel_path.encode('utf-8')
-                        f.write(struct.pack('I', len(encoded_path)))
-                        f.write(encoded_path)
-                        f.write(struct.pack('Q', len(content)))
-                        f.write(content)
+        try:
+            subprocess.run(qemu_cmd, check=True)
+        except subprocess.CalledProcessError:
+            print("\nQEMU terminó con errores")
+        except KeyboardInterrupt:
+            print("\nEjecución interrumpida")
 
-            shutil.move(temp_box, box_file)
-            print(f"LoveBox actualizada: {box_file}")
+        # Esperar antes de empaquetar
+        time.sleep(2)
+
+        # Re-empaquetar
+        os.chdir(original_dir)
+        temp_box = box_file + ".tmp"
+
+        with open(temp_box, 'wb') as f_out:
+            f_out.write(LOVEBOX_MAGIC)
+
+            for root, _, files in os.walk(temp_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, temp_dir)
+
+                    file_size = os.path.getsize(file_path)
+                    encoded_path = rel_path.encode('utf-8')
+                    f_out.write(struct.pack('I', len(encoded_path)))
+                    f_out.write(encoded_path)
+                    f_out.write(struct.pack('Q', file_size))
+
+                    with open(file_path, 'rb') as f_in:
+                        while True:
+                            chunk = f_in.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            f_out.write(chunk)
+
+        shutil.move(temp_box, box_file)
+        print(f"\nLoveBox actualizada: {box_file}")
 
     finally:
         os.chdir(original_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def main():
     parser = argparse.ArgumentParser(
